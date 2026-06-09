@@ -5,24 +5,30 @@
 
 Simply put, I wanted animator transition route nodes. That's all I needed. But in order to get that, I had to re-create (almost) the entire animator window...
 
-**Animator ++** is a single-file Unity editor tool that rebuilds the Animator graph experience with a practical goal: add transition reroutes, add transition parameter copy.
+**Animator ++** is a small Unity editor tool that rebuilds the Animator graph experience with a practical goal: adding editable transition reroutes and transition parameter copying.
 
 It does not try to replace Mecanim.
-Just tries to add a simple thing that hasn't been added in decades
-Eventually, I might start adding more stuff. But for now... 
+It just tries to add a simple thing that somehow has not been added for a decade.
 
+Eventually, I might add more features that I find useful, or see if someone suggest more. But for now, this is mainly a practical Animator workflow tool.
 
 ## Features
 - Animator-like graph window
 - Editable transition reroute points
-- Copy of transition parameters between transitions
-- And (HOPEFULLY!) all the animator features we commonly use
+- Copy transition parameters between transitions
+- Sub-state-machine navigation
+- Blend tree visualization
+- Multi-selection support
+- Play Mode state progress display
+- Layers and parameters sidebar
+- Hopefully, most of the Animator features we commonly use
+- ... And more (WIP snap to different grid sizes, configurable stuff and other stuff)
 
 ## Installation
 
 Install from Unity Package Manager using a Git URL:
 
-https://github.com/YOUR_USERNAME/YOUR_REPOSITORY.git?path=/Assets/UnityAnimatorExtended
+https://github.com/fedediazceo/UnityAnimatorPlusPlus.git?path=/Assets/UnityAnimatorPlusPlus
 
 ## Usage
 
@@ -31,6 +37,11 @@ Open from:
 Window > Animation > Animator ++
 
 Then select an AnimatorController or a GameObject with an Animator.
+
+## How-to
+
+Simple: Click CTRL+click, or right click "add reroute node" on a transition, to create a reroute node, and move it around
+For the transition parameter copy: Right click, parameter copy, right click, parameter paste on another transitions
 
 ## Screenshots
 
@@ -45,7 +56,9 @@ Parameter copying and more stuff
 
 This is an editor-only tool.
 It does not modify runtime Animator behavior.
-But USE IT WITH CAUTION as always, I'm not responsible if you nuke your animator because you press the wrong button. This is still in development and it's a tool I'm using consistenly
+Claude helped me build specifically the reflection parts needed to ping the internals of unity's animator data structures, with layouts and UI placement when the situation went dire and seemed hopeless, and finally to proper comment everything so someone else can understand what the hell is going on
+
+Use it with caution, as always. I am not responsible if you nuke your Animator because you pressed the wrong button. This is still in development, but it is a tool I am actively using.
 
 ## License
 
