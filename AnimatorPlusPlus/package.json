@@ -1,0 +1,17 @@
+{
+  "name": "com.fedediaz.animator-plus-plus",
+  "version": "0.1.0",
+  "displayName": "Animator++",
+  "description": "A Unity editor extension that provides an enhanced Animator graph window.",
+  "unity": "2022.3",
+  "keywords": [
+    "unity",
+    "animator",
+    "animation",
+    "editor",
+    "graph"
+  ],
+  "author": {
+    "name": "Fede Díaz"
+  }
+}
