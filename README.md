@@ -28,7 +28,9 @@ Eventually, I might add more features that I find useful, or see if someone sugg
 
 Install from Unity Package Manager using a Git URL:
 
-https://github.com/fedediazceo/UnityAnimatorPlusPlus.git?path=/Assets/UnityAnimatorPlusPlus
+https://github.com/fedediazceo/UnityAnimatorPlusPlus.git?path=/Assets/UnityAnimatorPlusPlus#v1.0.0
+
+Or download the unity package found in releases.
 
 ## Usage
 
