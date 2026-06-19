@@ -24,11 +24,28 @@ Eventually, I might add more features that I find useful, or see if someone sugg
 - Hopefully, most of the Animator features we commonly use
 - ... And more (WIP snap to different grid sizes, configurable stuff and other stuff)
 
+## Update: color picker
+- **Node colouring tool.** Organise the graph by tinting state and sub-state-machine
+  nodes with a custom colour. Tints recolour the node fill and border while keeping the
+  rounded corners, top→bottom gradient, drop shadow, and play-mode progress bar.
+  - Right-click a node (or a multi-selection) → **Color ▸ Pick a Color…** to choose a
+    custom colour, or **Color ▸ Clear** to remove the tint.
+  - Floating **Colors** palette pinned to the canvas's top-left with 10 reusable slots:
+    left-click a slot to paint the current node selection, right-click a slot to set its
+    colour, reset it, or paint the selection, and use the caret to collapse the panel.
+  - Tints are stored per node in the controller's `AnimatorRerouteData` sub-asset
+    (with full Undo/Redo) so they travel with the `.controller` asset.
+  - The 10 palette slots are an editor-wide preference saved in `EditorPrefs`.
+
+<img width="990" height="848" alt="ColorPaletteNodes" src="https://github.com/user-attachments/assets/f5653e73-dcba-471e-b1de-5bb1d11e989e" />
+
+- Ovearll fixes: Added motion drag and drop like the unity Animator, added blend tree cascade view, like the Animator
+
 ## Installation
 
 Install from Unity Package Manager using the Git URL:
 
-https://github.com/fedediazceo/UnityAnimatorPlusPlus.git#v0.1.0
+https://github.com/fedediazceo/UnityAnimatorPlusPlus.git#v0.1.1
 
 Or, use the .unitypackage from releases
 
