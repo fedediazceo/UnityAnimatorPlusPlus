@@ -46,8 +46,10 @@ namespace AnimatorPlusPlus.Editor
             public Vector2   size;             // zero uses the default node size
             public BlendTree blendTree;        // blend-tree backing object
             public bool      isBtRoot;         // root of the current blend-tree view
-            public bool      isBtChild;        // child motion in the current blend-tree view
+            public bool      isBtBox;          // a nested blend tree, expanded inline
+            public bool      isBtChild;        // leaf motion (clip) in the blend-tree view
             public int       btChildIndex = -1;
+            public float     btAct;            // effective activation in [0,1], recomputed each frame
 
             // ── Sub-state-machine view ───────────────────────────────────────────
             public bool                 isStateMachine;   // sub-state-machine node
@@ -655,6 +657,7 @@ namespace AnimatorPlusPlus.Editor
             if (n.state != null)                        return n.state.name;
             if (n.isStateMachine && n.subSM != null)    return n.subSM.name;
             if (n.isBtRoot && n.blendTree != null)      return n.blendTree.name;
+            if (n.isBtBox && n.blendTree != null)       return n.blendTree.name;
             if (n.isBtChild)                            return n.motion != null ? n.motion.name : "(None)";
             return n.name;
         }
@@ -1231,27 +1234,24 @@ namespace AnimatorPlusPlus.Editor
             return false;
         }
 
-        // The control value comes from the live Animator in play mode; in edit mode it's the parameter's
-        // default value — the same value the Animator/BlendTree inspector uses for its preview, so the
-        // slider and the inspector stay in sync.
-        private float GetBlendValue(string param)
+        private float GetBlendValue(BlendTree bt, string param)
         {
             if (string.IsNullOrEmpty(param)) return 0f;
             if (Application.isPlaying && liveAnim != null && HasFloatParam(param)) return liveAnim.GetFloat(param);
             // use the inspector preview store when available
-            if (CurrentBT != null && BlendPreviewBridge.TryGet(CurrentBT, param, out var bv)) return bv;
+            if (bt != null && BlendPreviewBridge.TryGet(bt, param, out var bv)) return bv;
             if (ctrl != null)
                 foreach (var p in ctrl.parameters)
                     if (p.type == AnimatorControllerParameterType.Float && p.name == param) return p.defaultFloat;
             return blendPreview.TryGetValue(param, out var v) ? v : 0f;
         }
 
-        private void SetBlendValue(string param, float v)
+        private void SetBlendValue(BlendTree bt, string param, float v)
         {
             if (string.IsNullOrEmpty(param)) return;
             if (Application.isPlaying && liveAnim != null && HasFloatParam(param)) { liveAnim.SetFloat(param, v); return; }
             // keep the inspector preview in sync.
-            if (CurrentBT != null && BlendPreviewBridge.TrySet(CurrentBT, param, v))
+            if (bt != null && BlendPreviewBridge.TrySet(bt, param, v))
             {
                 UnityEditorInternal.InternalEditorUtility.RepaintAllViews();
                 return;
@@ -1271,13 +1271,61 @@ namespace AnimatorPlusPlus.Editor
             blendPreview[param] = v;                    // last resort → local preview
         }
 
-        // Per-child activation weights for the current control values (cached each frame in blend view).
-        private float[] btWeights;
-        private int     btSignature;   // detects Inspector edits (type / params / motions / thresholds)
+        // Assign which controller float parameter drives a blend tree (idx 0 = X, idx 1 = Y for 2D).
+        private void SetBlendParameter(BlendTree bt, int paramIdx, string name)
+        {
+            if (bt == null) return;
+            Undo.RecordObject(bt, "Set Blend Parameter");
+            if (paramIdx == 1) bt.blendParameterY = name; else bt.blendParameter = name;
+            EditorUtility.SetDirty(bt);
+            BuildBlendTreeGraph();
+            Repaint();
+        }
+
+        private void ShowBlendParamMenu(BlendTree bt, int paramIdx, string current)
+        {
+            var menu = new GenericMenu();
+            if (ctrl != null)
+                foreach (var p in ctrl.parameters)
+                    if (p.type == AnimatorControllerParameterType.Float)
+                    {
+                        string pn = p.name;
+                        menu.AddItem(new GUIContent(pn), pn == current, () => SetBlendParameter(bt, paramIdx, pn));
+                    }
+            if (menu.GetItemCount() == 0) menu.AddDisabledItem(new GUIContent("No float parameters"));
+            menu.ShowAsContext();
+        }
+
+        private int btSignature;   // detects Inspector edits (type / params / motions / thresholds)
+
+        // Effective activation per node, propagated parent→child (a nested box's weight scales its children).
+        private void ComputeBtActivations()
+        {
+            foreach (var n in nodes) n.btAct = 0f;
+            var root = nodes.Find(n => n.isBtRoot);
+            if (root == null) return;
+            root.btAct = 1f;
+            WalkBtActivation(root);
+        }
+
+        private void WalkBtActivation(SNode box)
+        {
+            var bt = box.blendTree;
+            if (bt == null) return;
+            var local = ComputeBlendWeights(bt);
+            var tr = box.transitions;
+            for (int i = 0; i < tr.Count; i++)
+            {
+                var child = tr[i].to;
+                if (child == null) continue;
+                child.btAct = box.btAct * (i < local.Length ? local[i] : 0f);
+                if (child.isBtBox) WalkBtActivation(child);
+            }
+        }
 
         // A hash of everything that affects how the blend-tree graph is drawn, so edits made through the
         // Inspector (changing blend type, a motion field, thresholds, …) trigger a rebuild.
-        private static int ComputeBtSignature(BlendTree bt)
+        private static int ComputeBtSignature(BlendTree bt, int depth = 0)
         {
             unchecked
             {
@@ -1293,6 +1341,7 @@ namespace AnimatorPlusPlus.Editor
                     h = h * 31 + (c.motion != null ? c.motion.name.GetHashCode() : 0);
                     h = h * 31 + c.threshold.GetHashCode();
                     h = h * 31 + c.position.GetHashCode();
+                    if (c.motion is BlendTree cbt && depth < 16) h = h * 31 + ComputeBtSignature(cbt, depth + 1);
                 }
                 return h;
             }
@@ -1308,7 +1357,7 @@ namespace AnimatorPlusPlus.Editor
             if (!IsBlend2D(bt))
             {
                 // 1D: linear interpolation between the two adjacent thresholds around the control value.
-                float v = GetBlendValue(bt.blendParameter);
+                float v = GetBlendValue(bt, bt.blendParameter);
                 var order = new int[cc];
                 for (int i = 0; i < cc; i++) order[i] = i;
                 System.Array.Sort(order, (a, b) => ch[a].threshold.CompareTo(ch[b].threshold));
@@ -1329,14 +1378,12 @@ namespace AnimatorPlusPlus.Editor
 
             // 2D: approximate with normalized inverse-square-distance weighting (Unity computes this
             // exactly per blend type; this is close enough for a visual activation shade).
-            Vector2 p = new Vector2(GetBlendValue(bt.blendParameter), GetBlendValue(bt.blendParameterY));
+            Vector2 p = new Vector2(GetBlendValue(bt, bt.blendParameter), GetBlendValue(bt, bt.blendParameterY));
             float total = 0f;
             for (int i = 0; i < cc; i++) { float wi = 1f / ((ch[i].position - p).sqrMagnitude + 1e-4f); w[i] = wi; total += wi; }
             if (total > 0f) for (int i = 0; i < cc; i++) w[i] /= total;
             return w;
         }
-
-        private float BtWeight(int idx) => (btWeights != null && idx >= 0 && idx < btWeights.Length) ? btWeights[idx] : 0f;
 
         // Activation tint (gray → blue) shared by the blend links and the connector "●" dots.
         private static Color BtDotColor(float act)
@@ -1384,7 +1431,26 @@ namespace AnimatorPlusPlus.Editor
             Repaint();
         }
 
-        // Build the compact blend-tree view.
+        // Column gap between a box and its children; vertical gap between sibling subtrees.
+        private const float BtColGap = NodeW * 0.45f, BtSiblingGap = NodeH * 0.5f;
+
+        // A node in the recursive blend-tree layout (a box for a blend tree, a leaf for a clip).
+        private class BtLayout
+        {
+            public SNode          node;
+            public List<BtLayout> kids = new List<BtLayout>();
+            public float          w, h;        // box size
+            public float          subtreeH;    // total vertical span of this subtree
+        }
+
+        private static float BtBoxHeight(BlendTree bt)
+        {
+            int cc = bt.children.Length;
+            int sliders = IsBlend2D(bt) ? 2 : 1;
+            return BtHeaderH + BtPadTop + cc * BtRowH + BtSliderGap + sliders * BtSliderRowH + BtPadBot;
+        }
+
+        // Build the blend-tree view: nested blend trees are expanded inline as chained boxes.
         private void BuildBlendTreeGraph()
         {
             nodes.Clear();
@@ -1392,45 +1458,87 @@ namespace AnimatorPlusPlus.Editor
             var bt = CurrentBT;
             if (bt == null) { RebuildLists(); return; }
 
-            var children = bt.children;
-            int  cc          = children.Length;
-            int  sliderCount = IsBlend2D(bt) ? 2 : 1;   // one control slider per blend parameter
-            float rootH      = BtHeaderH + BtPadTop + cc * BtRowH + BtSliderGap + sliderCount * BtSliderRowH + BtPadBot;
-
-            var root = new SNode
-            {
-                name      = bt.name,
-                position  = Vector2.zero,
-                size      = new Vector2(BtRootW, rootH),
-                motion    = bt,
-                blendTree = bt,
-                isBtRoot  = true,
-            };
-            nodes.Add(root);
-
-            // Generated blend-tree layout; child nodes are not user-movable.
-            float childX     = BtRootW + NodeW * 0.45f;          // close to the main node
-            float spacing    = NodeH * 1.35f;                     // > NodeH ⇒ no overlap
-            float colHeight  = (Mathf.Max(cc, 1) - 1) * spacing;
-            float startY     = rootH * 0.5f - colHeight * 0.5f - NodeH * 0.5f;
-            for (int i = 0; i < cc; i++)
-            {
-                var cm = children[i];
-                var n = new SNode
-                {
-                    name         = cm.motion != null ? cm.motion.name : "(None)",
-                    position     = new Vector2(childX, startY + i * spacing),
-                    motion       = cm.motion,
-                    blendTree    = cm.motion as BlendTree,
-                    isBtChild    = true,
-                    btChildIndex = i,
-                };
-                nodes.Add(n);
-                root.transitions.Add(new STrans { from = root, to = n });
-            }
+            var root = BuildBtLayout(bt, bt, true, -1, new HashSet<BlendTree>());
+            MeasureBt(root);
+            PlaceBt(root, 0f, 0f);
+            AddBtNodes(root, null);
 
             btSignature = ComputeBtSignature(bt);   // remember this layout's signature for change detection
             RebuildLists();
+        }
+
+        private BtLayout BuildBtLayout(BlendTree bt, Motion motion, bool isRoot, int childIndex, HashSet<BlendTree> ancestors)
+        {
+            var L = new BtLayout();
+            if (bt != null && ancestors.Add(bt))   // skip recursion on a cyclic reference (drawn as a leaf)
+            {
+                L.w = BtRootW;
+                L.h = BtBoxHeight(bt);
+                L.node = new SNode
+                {
+                    name         = isRoot ? bt.name : (motion != null ? motion.name : bt.name),
+                    size         = new Vector2(L.w, L.h),
+                    motion       = motion != null ? motion : bt,
+                    blendTree    = bt,
+                    isBtRoot     = isRoot,
+                    isBtBox      = !isRoot,
+                    btChildIndex = childIndex,
+                };
+                var children = bt.children;
+                for (int i = 0; i < children.Length; i++)
+                {
+                    var cm = children[i];
+                    L.kids.Add(BuildBtLayout(cm.motion as BlendTree, cm.motion, false, i, ancestors));
+                }
+                ancestors.Remove(bt);
+            }
+            else
+            {
+                L.w = NodeW;
+                L.h = NodeH;
+                L.node = new SNode
+                {
+                    name         = motion != null ? motion.name : "(None)",
+                    size         = new Vector2(L.w, L.h),
+                    motion       = motion,
+                    isBtChild    = true,
+                    btChildIndex = childIndex,
+                };
+            }
+            return L;
+        }
+
+        private static float MeasureBt(BtLayout L)
+        {
+            if (L.kids.Count == 0) { L.subtreeH = L.h; return L.subtreeH; }
+            float sum = 0f;
+            foreach (var k in L.kids) sum += MeasureBt(k);
+            sum += BtSiblingGap * (L.kids.Count - 1);
+            L.subtreeH = Mathf.Max(L.h, sum);
+            return L.subtreeH;
+        }
+
+        private static void PlaceBt(BtLayout L, float x, float yCenter)
+        {
+            L.node.position = new Vector2(x, yCenter - L.h * 0.5f);
+            if (L.kids.Count == 0) return;
+
+            float childX = x + L.w + BtColGap;
+            float total  = -BtSiblingGap;
+            foreach (var k in L.kids) total += k.subtreeH + BtSiblingGap;
+            float top = yCenter - total * 0.5f;
+            foreach (var k in L.kids)
+            {
+                PlaceBt(k, childX, top + k.subtreeH * 0.5f);
+                top += k.subtreeH + BtSiblingGap;
+            }
+        }
+
+        private void AddBtNodes(BtLayout L, SNode parent)
+        {
+            nodes.Add(L.node);
+            if (parent != null) parent.transitions.Add(new STrans { from = parent, to = L.node });
+            foreach (var k in L.kids) AddBtNodes(k, L.node);
         }
 
         // Double-click: the root navigates up a level; any node holding a blend tree enters it.
@@ -1939,8 +2047,12 @@ namespace AnimatorPlusPlus.Editor
                 if (CurrentBT == null) ExitBlendTreeToDepth(btStack.Count - 1);          // tree deleted → go up
                 else if (ComputeBtSignature(CurrentBT) != btSignature) BuildBlendTreeGraph();  // Inspector edit → redraw
             }
-            // Recompute per-child activation each frame from the current control values.
-            btWeights = InBlendTree && CurrentBT != null ? ComputeBlendWeights(CurrentBT) : null;
+            // Recompute per-node activation each frame from the current control values.
+            if (InBlendTree && CurrentBT != null)
+            {
+                ComputeBtActivations();
+                BlendPreviewBridge.SetContext(ctrl, liveAnim);   // keep the inspector's parameter dropdown populated
+            }
 
             EditorGUI.DrawRect(new Rect(0, 0, position.width, position.height), BG);
 
@@ -2402,7 +2514,7 @@ namespace AnimatorPlusPlus.Editor
                 {
                     // Blend-tree link: curved spline from the root's right edge
                     // at the motion row to the child's lower third.
-                    if (t.from != null && t.from.isBtRoot)
+                    if (t.from != null && (t.from.isBtRoot || t.from.isBtBox))
                     {
                         int idx = t.to != null ? t.to.btChildIndex : 0;
 
@@ -2413,11 +2525,11 @@ namespace AnimatorPlusPlus.Editor
 
                         Vector2 dst = new Vector2(
                             t.to.position.x,
-                            t.to.position.y + NodeH * (2f / 3f)
+                            t.to.position.y + (t.to.isBtChild ? NodeH * (2f / 3f) : NodeSize(t.to).y * 0.5f)
                         );
 
                         // Gray when inactive → blue when fully active (Unity-style).
-                        float  act  = Mathf.Clamp01(t.to != null ? BtWeight(t.to.btChildIndex) : 0f);
+                        float  act  = Mathf.Clamp01(t.to != null ? t.to.btAct : 0f);
                         Color  col  = IsTransSel(t) ? NSelBord : Color.Lerp(new Color(0.55f, 0.55f, 0.55f), new Color(0.27f, 0.55f, 1f), act);
                         float  lw   = Mathf.Lerp(2f, 3.6f, act);
 
@@ -2639,7 +2751,7 @@ namespace AnimatorPlusPlus.Editor
                 // Subtle drop shadow under every node (light from top-left → shadow toward bottom-right).
                 DrawNodeShadow(rect, cr, n.isStateMachine || n.isUp, Mathf.Min(rect.height * 0.5f, 14f * zoom));
 
-                if (n.isBtRoot) { DrawBtRoot(n, rect, cr); continue; }
+                if (n.isBtRoot || n.isBtBox) { DrawBtRoot(n, rect, cr); continue; }
 
                 if (n.isBtChild) { DrawBtChild(n, rect, cr, fs); continue; }
 
@@ -2751,7 +2863,7 @@ namespace AnimatorPlusPlus.Editor
                 var dotR  = new Rect(rowR.xMax - dotSlotW, rowR.y, dotSlotW, rowR.height);
 
                 GUI.Label(textR, to != null ? to.name : "(None)", nameStyle);
-                dotStyle.normal.textColor = BtDotColor(BtWeight(i));   // gray → blue with activation
+                dotStyle.normal.textColor = BtDotColor(to != null ? to.btAct : 0f);   // gray → blue with activation
                 GUI.Label(dotR, "●", dotStyle);
             }
 
@@ -2777,19 +2889,25 @@ namespace AnimatorPlusPlus.Editor
 
             var lblStyle = new GUIStyle(EditorStyles.miniLabel)
             { alignment = TextAnchor.MiddleLeft, fontSize = Mathf.Max(Mathf.RoundToInt(9f * z), 6), clipping = TextClipping.Clip, normal = { textColor = new Color(0.78f, 0.78f, 0.78f) } };
-            GUI.Label(new Rect(area.x, area.y, lblW, area.height), string.IsNullOrEmpty(param) ? "(none)" : param, lblStyle);
+            lblStyle.hover.textColor = new Color(0.95f, 0.95f, 0.95f);
+            var lblRect = new Rect(area.x, area.y, lblW, area.height);
+            if (GUI.Button(lblRect, (string.IsNullOrEmpty(param) ? "(none)" : param) + " ▾", lblStyle))
+                ShowBlendParamMenu(bt, paramIdx, param);
 
             BlendRange(bt, paramIdx, out float min, out float max);
-            float val = GetBlendValue(param);
+            float val = GetBlendValue(bt, param);
 
+            float fldH  = Mathf.Min(area.height - 2f * z, 16f * z);
             var sliderR = new Rect(area.x + lblW + 4f * z, midY - 6f * z, area.width - lblW - fldW - 12f * z, 12f * z);
-            var fieldR  = new Rect(area.xMax - fldW, area.y + 1f, fldW, area.height - 2f);
+            var fieldR  = new Rect(area.xMax - fldW, midY - fldH * 0.5f, fldW, fldH);
+            var fieldStyle = new GUIStyle(EditorStyles.numberField)
+            { alignment = TextAnchor.MiddleRight, fontSize = Mathf.Max(Mathf.RoundToInt(9f * z), 6) };
 
             EditorGUI.BeginChangeCheck();
             float ns = GUI.HorizontalSlider(sliderR, val, min, max, GUIStyle.none, GUIStyle.none);
             DrawSliderTrackHandle(sliderR, Mathf.InverseLerp(min, max, ns), z);   // rounded handle visual
-            float nf = EditorGUI.FloatField(fieldR, ns);
-            if (EditorGUI.EndChangeCheck()) SetBlendValue(param, nf);
+            float nf = EditorGUI.FloatField(fieldR, Mathf.Round(ns * 1000f) / 1000f, fieldStyle);
+            if (EditorGUI.EndChangeCheck()) SetBlendValue(bt, param, Mathf.Round(nf * 1000f) / 1000f);
         }
 
         // A blend-tree child node: normal gray box, motion name nudged up, and a right-justified
@@ -2801,7 +2919,7 @@ namespace AnimatorPlusPlus.Editor
 
             // Gray activation shade applied to BOTH the border and the fill: ~30% darker (dark gray)
             // when inactive → normal gray when active.
-            float act = BtWeight(n.btChildIndex);
+            float act = n.btAct;
             float bf  = Mathf.Lerp(0.7f, 1f, act);
             DrawRoundedOutlineGradient(rect, cr, ot,
                 new Color(NBordTop.r * bf, NBordTop.g * bf, NBordTop.b * bf, 1f),
@@ -2815,11 +2933,12 @@ namespace AnimatorPlusPlus.Editor
             { alignment = TextAnchor.MiddleCenter, fontSize = fs, clipping = TextClipping.Clip, normal = { textColor = NText } };
             GUI.Label(new Rect(rect.x + 4f * zoom, rect.y + 3f * zoom, rect.width - 8f * zoom, rect.height * 0.58f), n.name, nameStyle);
 
-            // Bottom-left type tag: "Blend Tree" in gray, with the leading "●" tinted by activation.
+            // Bottom-left type tag, with the leading "●" tinted by activation.
+            string tag = n.motion is BlendTree ? "Blend Tree" : n.motion is AnimationClip ? "Clip" : "(None)";
             var tagRect  = new Rect(rect.x + 4f * zoom, rect.yMax - 14f * zoom, rect.width - 8f * zoom, 12f * zoom);
             var tagStyle = new GUIStyle(EditorStyles.miniLabel)
             { alignment = TextAnchor.MiddleLeft, fontSize = Mathf.Max(Mathf.RoundToInt(8f * zoom), 6), clipping = TextClipping.Clip, normal = { textColor = new Color(0.7569f, 0.7569f, 0.7569f) } };
-            GUI.Label(tagRect, "● Blend Tree", tagStyle);
+            GUI.Label(tagRect, "● " + tag, tagStyle);
             var tagDotStyle = new GUIStyle(tagStyle) { normal = { textColor = BtDotColor(act) } };
             GUI.Label(tagRect, "●", tagDotStyle);   // overlay just the dot in the activation color
         }
@@ -3195,7 +3314,11 @@ namespace AnimatorPlusPlus.Editor
 
                     // Keep Unity selection aligned with canvas selection.
                     if (multi) PushNodeSelectionToInspector();
-                    else if (InBlendTree && selNode != null) Selection.activeObject = selNode.motion;   // blend tree / clip inspector
+                    else if (InBlendTree && selNode != null)
+                    {
+                        BlendPreviewBridge.SetContext(ctrl, liveAnim);   // populate the inspector's parameter dropdown
+                        Selection.activeObject = selNode.motion;          // blend tree / clip inspector
+                    }
                     else if (ViewingSynced && selNode != null && selNode.state != null) SelectSyncedState(selNode);
                     else if (selNode != null && selNode.state != null) Selection.activeObject = selNode.state;
                     // Special nodes use Unity's native graph objects when available.
@@ -4600,7 +4723,7 @@ namespace AnimatorPlusPlus.Editor
     {
         static bool       s_Init;
         static MethodInfo s_Get, s_Set;          // internal preview accessors
-        static FieldInfo  s_CurAnimator, s_ParentBt, s_Callback;
+        static FieldInfo  s_CurAnimator, s_CurController, s_ParentBt, s_Callback;
 
         static void Init()
         {
@@ -4611,16 +4734,28 @@ namespace AnimatorPlusPlus.Editor
                 var t = typeof(UnityEditor.Editor).Assembly.GetType("UnityEditor.BlendTreeInspector");
                 if (t == null) return;
                 const BindingFlags S = BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
-                s_Get         = t.GetMethods(S).FirstOrDefault(m => m.Name == "GetParameterValue" && m.GetParameters().Length == 3);
-                s_Set         = t.GetMethods(S).FirstOrDefault(m => m.Name == "SetParameterValue" && m.GetParameters().Length == 5);
-                s_CurAnimator = t.GetField("currentAnimator",            S);
-                s_ParentBt    = t.GetField("parentBlendTree",           S);
-                s_Callback    = t.GetField("blendParameterInputChanged", S);
+                s_Get          = t.GetMethods(S).FirstOrDefault(m => m.Name == "GetParameterValue" && m.GetParameters().Length == 3);
+                s_Set          = t.GetMethods(S).FirstOrDefault(m => m.Name == "SetParameterValue" && m.GetParameters().Length == 5);
+                s_CurAnimator  = t.GetField("currentAnimator",            S);
+                s_ParentBt     = t.GetField("parentBlendTree",           S);
+                s_Callback     = t.GetField("blendParameterInputChanged", S);
+                // Drives the inspector's parameter dropdown; name varies by version, so fall back to type.
+                s_CurController = t.GetField("currentController", S)
+                               ?? t.GetFields(S).FirstOrDefault(f => f.FieldType == typeof(AnimatorController));
             }
             catch { /* leave Available == false */ }
         }
 
         public static bool Available { get { Init(); return s_Get != null && s_Set != null; } }
+
+        // Give the native BlendTreeInspector the controller/animator context so its parameter dropdown
+        // populates when a blend tree is opened from our window (mirrors what the Animator window does).
+        public static void SetContext(AnimatorController controller, Animator animator)
+        {
+            Init();
+            try { s_CurController?.SetValue(null, controller); } catch { }
+            try { if (animator != null) s_CurAnimator?.SetValue(null, animator); } catch { }
+        }
 
         static Animator  CurAnimator() { try { return s_CurAnimator?.GetValue(null) as Animator;  } catch { return null; } }
         static BlendTree ParentBt()    { try { return s_ParentBt?.GetValue(null)    as BlendTree; } catch { return null; } }
