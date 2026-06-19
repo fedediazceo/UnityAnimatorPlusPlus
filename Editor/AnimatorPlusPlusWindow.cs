@@ -16,6 +16,7 @@ using AnimatorStateMachine = UnityEditor.Animations.AnimatorStateMachine;
 using AnimatorStateTransition = UnityEditor.Animations.AnimatorStateTransition;
 using AnimatorTransition = UnityEditor.Animations.AnimatorTransition;
 using BlendTree = UnityEditor.Animations.BlendTree;
+using ChildMotion = UnityEditor.Animations.ChildMotion;
 using TransitionInterruptionSource = UnityEditor.Animations.TransitionInterruptionSource;
 
 namespace AnimatorPlusPlus.Editor
@@ -1288,7 +1289,7 @@ namespace AnimatorPlusPlus.Editor
                 h = h * 31 + ch.Length;
                 foreach (var c in ch)
                 {
-                    h = h * 31 + (c.motion != null ? c.motion.GetInstanceID() : 0);
+                    h = h * 31 + StableId(c.motion);
                     h = h * 31 + (c.motion != null ? c.motion.name.GetHashCode() : 0);
                     h = h * 31 + c.threshold.GetHashCode();
                     h = h * 31 + c.position.GetHashCode();
@@ -2981,12 +2982,36 @@ namespace AnimatorPlusPlus.Editor
                 if (draggingSplit && e.type == EventType.MouseUp) { draggingSplit = false; e.Use(); return; }
             }
 
-            // Blend-tree view: right-click only offers "Go Up" (no structural state-machine menu).
+            if ((e.type == EventType.DragUpdated || e.type == EventType.DragPerform)
+                && inCvs && !ViewingSynced && (InBlendTree ? CurrentBT != null : CurrentSM != null))
+            {
+                var dropped = DraggedMotions();
+                if (dropped.Count > 0)
+                {
+                    DragAndDrop.visualMode = DragAndDropVisualMode.Copy;
+                    if (e.type == EventType.DragPerform)
+                    {
+                        DragAndDrop.AcceptDrag();
+                        if (InBlendTree) AppendBlendTreeChildren(CurrentBT, dropped);
+                        else             CreateStatesFromMotions(dropped, mouseG);
+                    }
+                    e.Use(); return;
+                }
+            }
+
+            // Blend-tree view: right-click offers structural edits (add motion / nested tree) plus "Go Up".
             // Selection / drag / double-click still flow through the normal handlers below.
             if (InBlendTree && e.type == EventType.ContextClick && CVS.Contains(e.mousePosition))
             {
                 var bm = new GenericMenu();
                 int depth = btStack.Count;
+                var bt    = CurrentBT;
+                if (bt != null && !ViewingSynced)
+                {
+                    bm.AddItem(new GUIContent("Add Motion"),     false, () => AppendBlendTreeChildren(bt, new Motion[] { null }));
+                    bm.AddItem(new GUIContent("Add Blend Tree"), false, () => AddChildBlendTree(bt));
+                    bm.AddSeparator("");
+                }
                 bm.AddItem(new GUIContent("Go Up"), false, () => ExitBlendTreeToDepth(depth - 1));
                 bm.ShowAsContext(); e.Use(); return;
             }
@@ -3400,7 +3425,7 @@ namespace AnimatorPlusPlus.Editor
                         Undo.RegisterCreatedObjectUndo(bt, "Create Blend Tree State");
                         st.motion = bt;
                         EditorUtility.SetDirty(sm2);
-                        AssetDatabase.SaveAssets();
+                        DeferredSaveAssets();
                         RebuildView(); Repaint();
                     });
                     menu.AddItem(new GUIContent("Create Sub-State Machine"), false, () =>
@@ -3685,7 +3710,7 @@ namespace AnimatorPlusPlus.Editor
             }
             else return;
 
-            EditorUtility.SetDirty(sm); AssetDatabase.SaveAssets(); RebuildView(); Repaint();
+            EditorUtility.SetDirty(sm); DeferredSaveAssets(); RebuildView(); Repaint();
         }
 
         private void PasteStateMachine(Vector2 at)
@@ -3695,7 +3720,7 @@ namespace AnimatorPlusPlus.Editor
             Undo.RecordObject(dst, "Paste State Machine");
             var nsm = dst.AddStateMachine(smCopyBuffer.name, at);
             CopyStateMachineContents(smCopyBuffer, nsm);
-            EditorUtility.SetDirty(dst); AssetDatabase.SaveAssets(); RebuildView(); Repaint();
+            EditorUtility.SetDirty(dst); DeferredSaveAssets(); RebuildView(); Repaint();
         }
 
         // ── Operations ────────────────────────────────────────────────────────────
@@ -3802,6 +3827,80 @@ namespace AnimatorPlusPlus.Editor
             ctrl.AddParameter("Blend", AnimatorControllerParameterType.Float);
         }
 
+        // Motions (clips / blend trees) being dragged in from the Project window. AnimationClip and
+        // BlendTree both derive from Motion, so this also covers nested-tree assets.
+        private static List<Motion> DraggedMotions()
+        {
+            var result = new List<Motion>();
+            foreach (var o in DragAndDrop.objectReferences)
+                if (o is Motion m) result.Add(m);
+            return result;
+        }
+
+        // Drop handler for the state-machine view: one new state per motion, stacked vertically so a
+        // multi-clip drop doesn't pile up on a single spot.
+        private void CreateStatesFromMotions(IList<Motion> motions, Vector2 graphPos)
+        {
+            var sm = CurrentSM;
+            if (sm == null || motions == null || motions.Count == 0) return;
+            Undo.RecordObject(sm, motions.Count > 1 ? "Add States" : "Add State");
+            AnimatorState last = null;
+            Vector2 p = graphPos;
+            foreach (var m in motions)
+            {
+                if (m == null) continue;
+                var st   = sm.AddState(m.name, p);
+                st.motion = m;
+                last      = st;
+                p        += new Vector2(0f, NodeH * 1.4f);
+            }
+            EditorUtility.SetDirty(sm);
+            RebuildView();
+            if (last != null) Selection.activeObject = last;
+            Repaint();
+        }
+
+        // Append children to a blend tree. A null entry creates an empty motion field (matches Unity's
+        // "+" button). timeScale is forced to 1 — the ChildMotion default of 0 would freeze the clip.
+        private void AppendBlendTreeChildren(BlendTree bt, IList<Motion> motions)
+        {
+            if (bt == null || ctrl == null || motions == null || motions.Count == 0) return;
+            EnsureBlendParameter();
+            Undo.RecordObject(bt, motions.Count > 1 ? "Add Blend Tree Children" : "Add Blend Tree Child");
+            string directParam = string.IsNullOrEmpty(bt.blendParameter) ? "Blend" : bt.blendParameter;
+
+            var children = bt.children;
+            var list     = new List<ChildMotion>(children);
+            foreach (var m in motions)
+            {
+                list.Add(new ChildMotion
+                {
+                    motion               = m,
+                    timeScale            = 1f,
+                    cycleOffset          = 0f,
+                    position             = Vector2.zero,
+                    threshold            = list.Count,      // ascending defaults for 1D trees
+                    directBlendParameter = directParam,
+                    mirror               = false,
+                });
+            }
+            bt.children = list.ToArray();
+            EditorUtility.SetDirty(bt);
+            DeferredSaveAssets();
+            RebuildView();
+            Repaint();
+        }
+
+        // Create a new nested blend tree as a child of the given tree (stored as a sub-asset of the controller).
+        private void AddChildBlendTree(BlendTree parent)
+        {
+            if (parent == null || ctrl == null) return;
+            var child = new BlendTree { name = "Blend Tree" };
+            AssetDatabase.AddObjectToAsset(child, ctrl);
+            Undo.RegisterCreatedObjectUndo(child, "Add Child Blend Tree");
+            AppendBlendTreeChildren(parent, new Motion[] { child });
+        }
+
         private void CreateBlendTreeInState(SNode node)
         {
             if (node.state == null || ctrl == null) return;
@@ -3813,7 +3912,7 @@ namespace AnimatorPlusPlus.Editor
             var st = node.state;
             node.state.motion = bt;
             EditorUtility.SetDirty(ctrl);
-            AssetDatabase.SaveAssets();
+            DeferredSaveAssets();
             RebuildView();
             Selection.activeObject = st;
             Repaint();
@@ -3867,6 +3966,23 @@ namespace AnimatorPlusPlus.Editor
                     }
         }
 
+        // Unity 6.x asserts ('insideBlock || node.IsInline() || node.IsScalar()') when
+        // AssetDatabase.SaveAssets() runs mid-IMGUI — i.e. from inside event handling or a GenericMenu
+        // callback — because the controller is re-serialized while the editor is still in a GUI pass.
+        // Defer the save to the next editor tick, after the current event has finished. Objects are
+        // already marked dirty by the callers, so nothing is lost by saving a frame later.
+        private static bool saveQueued;
+        private static void DeferredSaveAssets()
+        {
+            if (saveQueued) return;
+            saveQueued = true;
+            EditorApplication.delayCall += () =>
+            {
+                saveQueued = false;
+                AssetDatabase.SaveAssets();
+            };
+        }
+
         // Persist reroute points for the current view.
         private void SaveReroutes()
         {
@@ -3890,7 +4006,7 @@ namespace AnimatorPlusPlus.Editor
                         data.entries.Add(new RerouteEntry { transition = t.src, stateMachine = view, points = new List<Vector2>(t.pts) });
 
             EditorUtility.SetDirty(data);
-            AssetDatabase.SaveAssets();
+            DeferredSaveAssets();
         }
 
         // ── Save positions ────────────────────────────────────────────────────────
@@ -3943,15 +4059,24 @@ namespace AnimatorPlusPlus.Editor
             EditorUtility.SetDirty(sm);
         }
 
-        // ── View memory (per-view pan/zoom) ───────────────────────────────────────
+        private static int StableId(Object obj)
+        {
+            if (obj == null) return 0;
+#if UNITY_6000_3_OR_NEWER
+            return (int)obj.GetEntityId();
+#else
+            return obj.GetInstanceID();
+#endif
+        }
+
         // Identifies the current view: controller + layer + sub-SM path + blend-tree path.
         private string ViewKey()
         {
             if (ctrl == null) return "";
             var sb = new System.Text.StringBuilder();
-            sb.Append(ctrl.GetInstanceID()).Append('|').Append(layer);
-            foreach (var s in smStack) sb.Append('/').Append(s != null ? s.GetInstanceID() : 0);
-            foreach (var b in btStack) sb.Append('#').Append(b != null ? b.GetInstanceID() : 0);
+            sb.Append(StableId(ctrl)).Append('|').Append(layer);
+            foreach (var s in smStack) sb.Append('/').Append(StableId(s));
+            foreach (var b in btStack) sb.Append('#').Append(StableId(b));
             return sb.ToString();
         }
 
