@@ -42,6 +42,8 @@ namespace AnimatorPlusPlus.Editor
             public List<STrans>  transitions = new List<STrans>();
             public bool isEntry, isExit, isAnyState, isDefault;
 
+            public Color tint;
+
             // ── Blend-tree view ──────────────────────────────────────────────────
             public Vector2   size;             // zero uses the default node size
             public BlendTree blendTree;        // blend-tree backing object
@@ -465,6 +467,62 @@ namespace AnimatorPlusPlus.Editor
         private static readonly Color EntryLine  = Hex("4f3501"); // entry line
         private static readonly Color EntryArrow = Hex("996600"); // entry arrow
         private static readonly Color RubberCol = new Color32(68,  148, 255, 200);
+
+        // ── Node colour tool ───────────────────────────────────────────────────────
+        // The floating palette's 10 reusable slots. Editor-wide (shared by every window) and persisted
+        // in EditorPrefs, so it's a personal tool palette rather than per-controller data.
+        private const int    PaletteSlots       = 10;
+        private const string PalettePrefKey     = "AnimatorPlusPlus.ColorPalette";
+        private const string PaletteCollapsedKey = "AnimatorPlusPlus.ColorPaletteCollapsed";
+
+        private static readonly Color[] DefaultPalette =
+        {
+            Hex("c0504d"), Hex("d99a33"), Hex("c9b94e"), Hex("5a9b4e"), Hex("4e9b8f"),
+            Hex("4d7fc0"), Hex("8a5fb0"), Hex("c060a0"), Hex("9b6a4e"), Hex("6f6f6f"),
+        };
+
+        private static Color[] paletteSlots;
+        private static bool    paletteLoaded;
+        private static bool    paletteCollapsed;
+        private        Rect    paletteRect;        // window-space bounds, for event guarding
+
+        private static void EnsurePalette()
+        {
+            if (paletteLoaded) return;
+            paletteLoaded    = true;
+            paletteCollapsed = EditorPrefs.GetBool(PaletteCollapsedKey, false);
+            paletteSlots     = (Color[])DefaultPalette.Clone();
+            var s = EditorPrefs.GetString(PalettePrefKey, "");
+            if (!string.IsNullOrEmpty(s))
+            {
+                var parts = s.Split(';');
+                for (int i = 0; i < paletteSlots.Length && i < parts.Length; i++)
+                    if (ColorUtility.TryParseHtmlString("#" + parts[i], out var c)) paletteSlots[i] = c;
+            }
+        }
+
+        private static void SavePalette()
+        {
+            var sb = new System.Text.StringBuilder();
+            for (int i = 0; i < paletteSlots.Length; i++)
+            {
+                if (i > 0) sb.Append(';');
+                sb.Append(ColorUtility.ToHtmlStringRGB(paletteSlots[i]));
+            }
+            EditorPrefs.SetString(PalettePrefKey, sb.ToString());
+        }
+
+        // Derive fill/border top→bottom gradient pairs from a single base colour, preserving the
+        // node's normal shading (lighter top, darker bottom; border lighter than the fill).
+        private static void TintGradients(Color c, out Color fillTop, out Color fillBot, out Color bordTop, out Color bordBot)
+        {
+            Color Scale(Color x, float f) =>
+                new Color(Mathf.Clamp01(x.r * f), Mathf.Clamp01(x.g * f), Mathf.Clamp01(x.b * f), 1f);
+            fillTop = Scale(c, 1.10f);
+            fillBot = Scale(c, 0.84f);
+            bordTop = Scale(c, 1.45f);
+            bordBot = Scale(c, 0.92f);
+        }
 
         // ── Layer settings popup ──────────────────────────────────────────────────
         private class LayerSettingsPopup : PopupWindowContent
@@ -1100,6 +1158,7 @@ namespace AnimatorPlusPlus.Editor
             }
 
             LoadReroutes();            // re-apply persisted reroute points
+            LoadNodeColors();          // re-apply persisted organisational tints
         }
 
         // Does `a` equal or (recursively) contain sub-state-machine `b`?
@@ -2072,6 +2131,7 @@ namespace AnimatorPlusPlus.Editor
 
             DrawCanvasFooter();
             DrawCanvasInnerShadow();
+            DrawColorPalette();
             DrawOverlay();
             HandleEvents(e);
 
@@ -2759,6 +2819,7 @@ namespace AnimatorPlusPlus.Editor
                 {
                     Color fTop = n.isUp ? NDefFillTop : NFillTop, fBot = n.isUp ? NDefFillBot : NFillBot;
                     Color bTop = n.isUp ? NDefBordTop : NBordTop, bBot = n.isUp ? NDefBordBot : NBordBot;
+                    if (!n.isUp && n.tint.a > 0f) TintGradients(n.tint, out fTop, out fBot, out bTop, out bBot);
                     float bot  = Mathf.Max(1f, zoom);
                     float bev  = Mathf.Min(rect.height * 0.5f, 14f * zoom);   // angled left/right corners
                     if (IsSel(n)) DrawBeveledSelOutline(rect, bev, bot);
@@ -2791,15 +2852,14 @@ namespace AnimatorPlusPlus.Editor
                 float ot = Mathf.Max(1f, zoom);
                 if (sel)
                     DrawNodeSelOutline(rect, cr, ot);
-                if (n.isDefault)
-                    DrawRoundedOutlineGradient(rect, cr, ot, NDefBordTop, NDefBordBot);
-                else
-                    DrawRoundedOutlineGradient(rect, cr, ot, NBordTop, NBordBot);
 
-                // Default state keeps its amber gradient; everything else uses the normal
-                // node fill. Live/next states are NOT tinted blue — only the play bar moves.
-                if (n.isDefault) DrawNodeFill(rect, cr, NDefFillTop, NDefFillBot);
-                else             DrawNodeFill(rect, cr, NFillTop, NFillBot);
+                Color nfTop, nfBot, nbTop, nbBot;
+                if (n.tint.a > 0f)        TintGradients(n.tint, out nfTop, out nfBot, out nbTop, out nbBot);
+                else if (n.isDefault)   { nfTop = NDefFillTop; nfBot = NDefFillBot; nbTop = NDefBordTop; nbBot = NDefBordBot; }
+                else                    { nfTop = NFillTop;    nfBot = NFillBot;    nbTop = NBordTop;    nbBot = NBordBot;    }
+
+                DrawRoundedOutlineGradient(rect, cr, ot, nbTop, nbBot);
+                DrawNodeFill(rect, cr, nfTop, nfBot);
 
                 if (n.motion is BlendTree)
                 {
@@ -3074,6 +3134,96 @@ namespace AnimatorPlusPlus.Editor
             }
         }
 
+        // Floating colour palette pinned to the canvas's top-left. Left-click a slot to paint the current
+        // node selection; right-click a slot to redefine/reset it. Slots persist editor-wide in EditorPrefs.
+        private void DrawColorPalette()
+        {
+            paletteRect = default;
+            if (ctrl == null || ctrl.layers.Length == 0) return;
+            EnsurePalette();
+
+            const float pad = 6f, sw = 20f, gap = 4f, headerH = 16f, clearH = 16f;
+            const int   cols = 5;
+            int rows  = (PaletteSlots + cols - 1) / cols;
+
+            float panelW = pad * 2 + cols * sw + (cols - 1) * gap;
+            float bodyH  = paletteCollapsed ? 0f : rows * sw + (rows - 1) * gap + gap + clearH;
+            float panelH = headerH + bodyH + pad;
+
+            float x = CVS.x + 10f, y = CVS.y + 10f;
+            paletteRect = new Rect(x, y, panelW, panelH);
+
+            // Panel + 1px border
+            EditorGUI.DrawRect(paletteRect, new Color(0.16f, 0.16f, 0.16f, 0.94f));
+            DrawRectBorder(paletteRect, new Color(0f, 0f, 0f, 0.65f));
+
+            // Header: title + collapse caret
+            var titleStyle = new GUIStyle(EditorStyles.miniBoldLabel) { normal = { textColor = new Color(0.82f, 0.82f, 0.82f) } };
+            GUI.Label(new Rect(x + pad, y, panelW - pad - 18f, headerH), "Colors", titleStyle);
+            var caretStyle = new GUIStyle(EditorStyles.miniLabel) { alignment = TextAnchor.MiddleCenter, normal = { textColor = new Color(0.7f, 0.7f, 0.7f) } };
+            if (GUI.Button(new Rect(x + panelW - 18f, y, 16f, headerH), paletteCollapsed ? "▸" : "▾", caretStyle))
+            {
+                paletteCollapsed = !paletteCollapsed;
+                EditorPrefs.SetBool(PaletteCollapsedKey, paletteCollapsed);
+                Repaint();
+            }
+
+            if (paletteCollapsed) return;
+
+            int selCount = SelectedColorTargets().Count;
+            Color? selTint = selNode != null && selNode.tint.a > 0f ? selNode.tint : (Color?)null;
+            var e = Event.current;
+
+            for (int i = 0; i < PaletteSlots; i++)
+            {
+                int   r  = i / cols, c = i % cols;
+                var   sr = new Rect(x + pad + c * (sw + gap), y + headerH + r * (sw + gap), sw, sw);
+
+                // Swatch fill + border (highlighted when it matches the focused node's tint)
+                EditorGUI.DrawRect(sr, paletteSlots[i]);
+                bool match = selTint.HasValue && ApproximatelyRGB(selTint.Value, paletteSlots[i]);
+                DrawRectBorder(sr, match ? NSelBord : new Color(0f, 0f, 0f, 0.7f), match ? 2f : 1f);
+
+                EditorGUIUtility.AddCursorRect(sr, MouseCursor.Link);
+
+                if (e.type == EventType.MouseDown && sr.Contains(e.mousePosition))
+                {
+                    int idx = i;
+                    if (e.button == 1)
+                    {
+                        var m = new GenericMenu();
+                        if (selCount > 0) m.AddItem(new GUIContent($"Paint {selCount} selected"), false, () => PaintSelection(paletteSlots[idx]));
+                        else              m.AddDisabledItem(new GUIContent("Paint selection (none selected)"));
+                        m.AddSeparator("");
+                        m.AddItem(new GUIContent("Set Slot Color…"), false, () =>
+                            ShowColorPicker(paletteSlots[idx], col => { col.a = 1f; paletteSlots[idx] = col; SavePalette(); Repaint(); }));
+                        m.AddItem(new GUIContent("Reset Slot"), false, () => { paletteSlots[idx] = DefaultPalette[idx]; SavePalette(); Repaint(); });
+                        m.ShowAsContext();
+                    }
+                    else
+                    {
+                        PaintSelection(paletteSlots[idx]);
+                    }
+                    e.Use();
+                    Repaint();
+                }
+            }
+
+            // Clear-tint button (acts on the selection)
+            var clr = new Rect(x + pad, y + headerH + rows * (sw + gap) + gap, panelW - pad * 2f, clearH);
+            using (new EditorGUI.DisabledScope(selCount == 0))
+                if (GUI.Button(clr, "Clear", EditorStyles.miniButton)) ClearSelectionColor();
+        }
+
+        // 1px (or thicker) rectangular border drawn just inside a rect.
+        private static void DrawRectBorder(Rect r, Color c, float t = 1f)
+        {
+            EditorGUI.DrawRect(new Rect(r.x, r.y, r.width, t), c);
+            EditorGUI.DrawRect(new Rect(r.x, r.yMax - t, r.width, t), c);
+            EditorGUI.DrawRect(new Rect(r.x, r.y, t, r.height), c);
+            EditorGUI.DrawRect(new Rect(r.xMax - t, r.y, t, r.height), c);
+        }
+
         private void DrawOverlay()
         {
             if (makingTransFrom == null) return;
@@ -3090,6 +3240,13 @@ namespace AnimatorPlusPlus.Editor
             bool inCvs = CVS.Contains(e.mousePosition);
             Vector2 mouse  = e.mousePosition;
             Vector2 mouseG = W2G(mouse);
+
+            // Swallow canvas interactions that land on the floating colour palette so they don't start a
+            // marquee / clear the selection (the palette handled its own clicks in DrawColorPalette).
+            if (paletteRect.width > 0f && paletteRect.Contains(mouse)
+                && (e.type == EventType.MouseDown || e.type == EventType.MouseUp
+                    || e.type == EventType.ContextClick || e.type == EventType.ScrollWheel))
+            { e.Use(); return; }
 
             // Sidebar resize splitter (takes priority over canvas interaction)
             if (showSidebar)
@@ -3447,6 +3604,8 @@ namespace AnimatorPlusPlus.Editor
                         menu.AddItem(new GUIContent("Copy"),      false, () => smCopyBuffer = cn.subSM);
                         menu.AddItem(new GUIContent("Duplicate"), false, () => DuplicateNode(cn));
                         menu.AddSeparator("");
+                        AddColorMenu(menu, cn);
+                        menu.AddSeparator("");
                         menu.AddItem(new GUIContent("Delete"), false, () =>
                         {
                             var sm2 = CurrentSM; if (sm2 == null || cn.subSM == null) return;
@@ -3496,6 +3655,8 @@ namespace AnimatorPlusPlus.Editor
                                 CopySelectionToBuffer();
                             });
                             menu.AddItem(new GUIContent("Duplicate"), false, () => DuplicateNode(cn));
+                            menu.AddSeparator("");
+                            AddColorMenu(menu, cn);
                             menu.AddSeparator("");
                             menu.AddItem(new GUIContent("Delete"), false, () =>
                             {
@@ -4130,6 +4291,193 @@ namespace AnimatorPlusPlus.Editor
 
             EditorUtility.SetDirty(data);
             DeferredSaveAssets();
+        }
+
+        // ── Node colours ────────────────────────────────────────────────────────────
+        // The backing object a colour is keyed by, or null for nodes that can't be coloured
+        // (Entry/Exit/Any State, the "(UP)" node, blend-tree boxes).
+        private static Object NodeColorKey(SNode n)
+        {
+            if (n == null) return null;
+            if (n.state != null) return n.state;
+            if (n.isStateMachine && !n.isUp && n.subSM != null) return n.subSM;
+            return null;
+        }
+
+        private static bool CanColorNode(SNode n) => NodeColorKey(n) != null;
+
+        // Re-apply persisted tints to the rebuilt nodes for the current view.
+        private void LoadNodeColors()
+        {
+            var data = FindRerouteData();
+            if (data == null) return;
+            foreach (var n in nodes)
+            {
+                var key = NodeColorKey(n);
+                if (key == null) continue;
+                var e = data.nodeColors.Find(x => x.target == key);
+                n.tint = e != null ? e.color : default;
+            }
+        }
+
+        // Set (or clear) the tint on a set of nodes and persist it. Clearing removes the stored entry
+        // so an untinted node falls back to its default gradient. Mirrors SaveReroutes' deferred save.
+        private void SetNodeColor(IEnumerable<SNode> targets, Color color, bool clear)
+        {
+            var data = GetOrCreateRerouteData();
+            if (data == null) return;
+
+            Undo.RecordObject(data, "Set Node Color");
+
+            foreach (var n in targets)
+            {
+                var key = NodeColorKey(n);
+                if (key == null) continue;
+                var e = data.nodeColors.Find(x => x.target == key);
+                if (clear)
+                {
+                    if (e != null) data.nodeColors.Remove(e);
+                    n.tint = default;
+                }
+                else
+                {
+                    color.a = 1f;                     // alpha doubles as the "has tint" flag
+                    if (e == null) { e = new NodeColorEntry { target = key }; data.nodeColors.Add(e); }
+                    e.color = color;
+                    n.tint  = color;
+                }
+            }
+
+            data.nodeColors.RemoveAll(x => x.target == null);   // prune orphaned entries
+            EditorUtility.SetDirty(data);
+            DeferredSaveAssets();
+            Repaint();
+        }
+
+        // The nodes a colour action applies to: the whole colourable selection when the clicked node is
+        // part of a multi-selection, otherwise just the clicked node.
+        private List<SNode> ColorTargets(SNode clicked)
+        {
+            var list = new List<SNode>();
+            if (selNodes.Contains(clicked) && selNodes.Count > 1)
+                foreach (var n in selNodes) { if (CanColorNode(n)) list.Add(n); }
+            else if (CanColorNode(clicked))
+                list.Add(clicked);
+            return list;
+        }
+
+        // Colourable nodes in the current selection (used by the floating palette).
+        private List<SNode> SelectedColorTargets()
+        {
+            var list = new List<SNode>();
+            foreach (var n in selNodes) if (CanColorNode(n)) list.Add(n);
+            return list;
+        }
+
+        private void PaintSelection(Color c)
+        {
+            var targets = SelectedColorTargets();
+            if (targets.Count > 0) SetNodeColor(targets, c, false);
+        }
+
+        private void ClearSelectionColor()
+        {
+            var targets = SelectedColorTargets();
+            if (targets.Count > 0) SetNodeColor(targets, default, true);
+        }
+
+        // Append the "Color" submenu (custom picker + clear) for a clicked node. Quick reusable swatches
+        // live in the floating palette instead.
+        private void AddColorMenu(GenericMenu menu, SNode clicked)
+        {
+            if (!CanColorNode(clicked)) return;
+
+            menu.AddItem(new GUIContent("Color/Pick a Color…"), false, () =>
+            {
+                Color init = clicked.tint.a > 0f ? clicked.tint : Color.gray;
+                var targets = ColorTargets(clicked);
+                ShowColorPicker(init, c => SetNodeColor(targets, c, false));
+            });
+            if (clicked.tint.a > 0f)
+                menu.AddItem(new GUIContent("Color/Clear"), false, () => SetNodeColor(ColorTargets(clicked), default, true));
+            else
+                menu.AddDisabledItem(new GUIContent("Color/Clear"));
+        }
+
+        private static bool ApproximatelyRGB(Color a, Color b) =>
+            Mathf.Abs(a.r - b.r) < 0.01f && Mathf.Abs(a.g - b.g) < 0.01f && Mathf.Abs(a.b - b.b) < 0.01f;
+
+        private static void ShowColorPicker(Color initial, System.Action<Color> onChanged)
+        {
+            var t = typeof(EditorWindow).Assembly.GetType("UnityEditor.ColorPicker");
+            if (t != null)
+            {
+                MethodInfo show = null;
+                foreach (var m in t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static))
+                {
+                    if (m.Name != "Show") continue;
+                    var ps = m.GetParameters();
+                    if (ps.Length < 2 || ps[0].ParameterType != typeof(System.Action<Color>)) continue;
+                    // Prefer an overload that also takes a Color (so we can seed the starting colour).
+                    if (show == null || System.Array.Exists(ps, p => p.ParameterType == typeof(Color)))
+                        show = m;
+                }
+
+                if (show != null)
+                {
+                    var ps   = show.GetParameters();
+                    var args = new object[ps.Length];
+                    args[0]  = onChanged;
+                    bool colorSet = false;
+                    for (int i = 1; i < ps.Length; i++)
+                    {
+                        var pt = ps[i].ParameterType;
+                        if (!colorSet && pt == typeof(Color)) { args[i] = initial; colorSet = true; }
+                        else if (pt == typeof(bool))          args[i] = false;                       // showAlpha / hdr off
+                        else if (ps[i].HasDefaultValue)        args[i] = ps[i].DefaultValue;
+                        else if (pt.IsValueType)               args[i] = System.Activator.CreateInstance(pt);
+                        else                                   args[i] = null;
+                    }
+                    try { show.Invoke(null, args); return; }
+                    catch (System.Exception ex) { Debug.LogWarning("Animator ++: native colour picker failed (" + ex.Message + "), using fallback."); }
+                }
+            }
+
+            ColorPickerPopup.Open(initial, onChanged);   // public-API fallback
+        }
+
+        // Minimal public-API colour picker: a utility window whose ColorField itself opens Unity's
+        // native picker on click and reports changes live. Used only if reflection can't bind ColorPicker.
+        private class ColorPickerPopup : EditorWindow
+        {
+            private Color color;
+            private System.Action<Color> onChanged;
+
+            public static void Open(Color initial, System.Action<Color> cb)
+            {
+                var w = CreateInstance<ColorPickerPopup>();
+                w.titleContent = new GUIContent("Node Color");
+                w.color        = initial.a > 0f ? initial : Color.gray;
+                w.onChanged    = cb;
+                w.minSize      = new Vector2(260, 84);
+                w.maxSize      = new Vector2(260, 84);
+                w.ShowUtility();
+            }
+
+            private void OnGUI()
+            {
+                GUILayout.Space(6);
+                EditorGUI.BeginChangeCheck();
+                color = EditorGUILayout.ColorField(new GUIContent("Color"), color, true, false, false);
+                if (EditorGUI.EndChangeCheck()) onChanged?.Invoke(color);
+
+                GUILayout.Space(8);
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    if (GUILayout.Button("Apply")) { onChanged?.Invoke(color); Close(); }
+                    if (GUILayout.Button("Close")) Close();
+                }
+            }
         }
 
         // ── Save positions ────────────────────────────────────────────────────────

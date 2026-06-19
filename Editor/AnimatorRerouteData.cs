@@ -15,8 +15,19 @@ namespace AnimatorPlusPlus.Editor
         public List<Vector2>           points = new List<Vector2>();
     }
 
+    // A user-chosen organisational colour for a single node, keyed by its backing object
+    // (an AnimatorState or a sub-AnimatorStateMachine). Stored alongside reroute data so it
+    // travels with the controller asset.
+    [System.Serializable]
+    public class NodeColorEntry
+    {
+        public Object target;          // AnimatorState or AnimatorStateMachine
+        public Color  color = Color.white;
+    }
+
     public class AnimatorRerouteData : ScriptableObject
     {
-        public List<RerouteEntry> entries = new List<RerouteEntry>();
+        public List<RerouteEntry>    entries    = new List<RerouteEntry>();
+        public List<NodeColorEntry>  nodeColors = new List<NodeColorEntry>();
     }
 }
