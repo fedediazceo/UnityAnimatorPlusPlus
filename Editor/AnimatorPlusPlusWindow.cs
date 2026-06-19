@@ -4534,7 +4534,7 @@ namespace AnimatorPlusPlus.Editor
         {
             if (obj == null) return 0;
 #if UNITY_6000_3_OR_NEWER
-            return (int)obj.GetEntityId();
+            return obj.GetEntityId().GetHashCode();
 #else
             return obj.GetInstanceID();
 #endif
